@@ -520,6 +520,7 @@ struct goodix_ts_core {
 	int power_on;
 	int irq;
 	size_t irq_trig_cnt;
+	void *notifier_cookie;
 
 	atomic_t irq_enabled;
 	atomic_t suspended;
@@ -567,6 +568,7 @@ struct goodix_ts_core {
 	bool tp_pm_suspend;
 	struct completion pm_resume_completion;
 	struct notifier_block notifier;
+	struct delayed_work panel_notifier_register_work;
 };
 
 /* external module structures */

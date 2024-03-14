@@ -20,7 +20,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 
-#include "mi_disp_notifier.h"
+#include <linux/soc/qcom/panel_event_notifier.h>
 #include <linux/backlight.h>
 //#include <drm/drm_panel.h>
 #include <linux/power_supply.h>
@@ -52,6 +52,37 @@ struct goodix_ts_core *goodix_core_data;
 static int goodix_send_ic_config(struct goodix_ts_core *cd, int type);
 static void goodix_set_gesture_work(struct work_struct *work);
 int goodix_ts_get_lockdown_info(struct goodix_ts_core *cd);
+
+struct drm_panel *active_panel;
+extern struct device_node *gf_spi_dp;
+
+static int goodix_ts_check_panel(void)
+{
+	int i;
+	int count;
+	struct device_node *node;
+	struct drm_panel *panel;
+
+	if (gf_spi_dp == NULL) {
+		ts_err("dp is null,failed to find active panel");
+		return -ENODEV;
+	}
+
+	count = of_count_phandle_with_args(gf_spi_dp, "panel", NULL);
+	if (count <= 0)
+		return -ENODEV;
+	for (i = 0; i < count; i++) {
+		node = of_parse_phandle(gf_spi_dp, "panel", i);
+		panel = of_drm_find_panel(node);
+		of_node_put(node);
+		if (!IS_ERR(panel)) {
+			active_panel = panel;
+			return 0;
+		}
+	}
+	return PTR_ERR(panel);
+}
+
 /**
  * __do_register_ext_module - register external module
  * to register into touch core modules structure
@@ -2212,60 +2243,77 @@ static void goodix_ts_suspend_work(struct work_struct *work)
 	goodix_ts_suspend(core_data);
 }
 
-int goodix_drm_state_change_callback(struct notifier_block *self,
-		unsigned long event, void *data)
+void goodix_drm_state_change_callback(enum panel_event_notifier_tag tag,
+				      struct panel_event_notification *event,
+				      void *data)
 {
-		struct goodix_ts_core *core_data =
-		container_of(self, struct goodix_ts_core, notifier);
-	struct mi_disp_notifier *evdata = data;
-	int blank;
 
+	struct goodix_ts_core *core_data = data;
 
-	if (evdata && evdata->data && core_data) {
-		blank = *(int *)(evdata->data);
-		ts_info("notifier tp event:%d, code:%d.", event, blank);
+	if (event == NULL) {
+		ts_err("Invalid notification");
+		return;
+	}
+
+	ts_info("Notification type:%d, early_trigger:%d", event->notif_type,
+		event->notif_data.early_trigger);
+	switch (event->notif_type) {
+	case 1:
+	case 3:
+		if (event->notif_data.early_trigger) {
+			return;
+		}
+		if (atomic_read(&core_data->suspended)) {
+			return;
+		}
+		ts_info("FB_BLANK %s",
+			event->notif_type == 3 ? "POWER DOWN" : "LP");
 		flush_workqueue(core_data->event_wq);
-		if (event == MI_DISP_DPMS_EARLY_EVENT && (blank == MI_DISP_DPMS_POWERDOWN || blank == MI_DISP_DPMS_LP1 || blank == MI_DISP_DPMS_LP2)) {
-			ts_info("touchpanel suspend by %s", blank ==  MI_DISP_DPMS_POWERDOWN ? "blank" : "doze");
-			queue_work(core_data->event_wq, &core_data->suspend_work);
-		} else if (event == MI_DISP_DPMS_EVENT && blank == MI_DISP_DPMS_ON) {
-			ts_info("touchpanel resume");
-			queue_work(core_data->event_wq, &core_data->resume_work);
+		queue_work(core_data->event_wq, &core_data->suspend_work);
+		break;
+	case 2:
+		if (event->notif_data.early_trigger) {
+			return;
 		}
+	ts_info("FB_BLANK_UNBLANK");
+		flush_workqueue(core_data->event_wq);
+		queue_work(core_data->event_wq, &core_data->resume_work);
+		break;
+	case 4:
+		break;
+	default:
+		ts_err("%s: notification serviced :%d", __func__,
+		       event->notif_type);
+		break;
 	}
-
-	return 0;
-
 }
 
-#ifdef CONFIG_FB
-/**
- * goodix_ts_fb_notifier_callback - Framebuffer notifier callback
- * Called by kernel during framebuffer blanck/unblank phrase
- */
-int goodix_ts_fb_notifier_callback(struct notifier_block *self,
-	unsigned long event, void *data)
+void goodix_register_panel_notifier_work(struct work_struct *work)
 {
-	struct goodix_ts_core *core_data =
-		container_of(self, struct goodix_ts_core, fb_notifier);
-	struct fb_event *fb_event = data;
+	static int check_count = 0;
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct goodix_ts_core *cd = container_of(dwork, struct goodix_ts_core,
+						 panel_notifier_register_work);
+	ts_info("%s enter", __func__);
+	goodix_ts_check_panel();
 
-	if (fb_event && fb_event->data && core_data) {
-		if (event == FB_EARLY_EVENT_BLANK) {
-			/* before fb blank */
-		} else if (event == FB_EVENT_BLANK) {
-			int *blank = fb_event->data;
-			if (*blank == FB_BLANK_UNBLANK)
-				goodix_ts_resume(core_data);
-			else if (*blank == FB_BLANK_POWERDOWN)
-				goodix_ts_suspend(core_data);
+	if (active_panel == NULL) {
+		ts_err("Failed to register panel notifier, try again");
+		if (check_count < 5) {
+			check_count++;
+			queue_delayed_work(system_wq, dwork, 0x4e2);
+			return;
+		}
+		ts_err("Failed to register panel notifier, not try");
+	} else {
+		cd->notifier_cookie = (void *)panel_event_notifier_register(
+			1, 0, active_panel, goodix_drm_state_change_callback,
+			cd);
+		if (cd->notifier_cookie == NULL) {
+			ts_err("Failed to register for panel events");
 		}
 	}
-
-	return 0;
 }
-#endif
-
 
 #ifdef CONFIG_PM
 /**
@@ -2419,24 +2467,29 @@ int goodix_ts_stage2_init(struct goodix_ts_core *cd)
 	/* register suspend and resume notifier callchain */
 	INIT_WORK(&cd->suspend_work, goodix_ts_suspend_work);
 	INIT_WORK(&cd->resume_work, goodix_ts_resume_work);
-	cd->notifier.notifier_call = goodix_drm_state_change_callback;
-#ifdef CONFIG_FB
-	cd->fb_notifier.notifier_call = goodix_ts_fb_notifier_callback;
-	if (fb_register_client(&cd->fb_notifier))
-		ts_err("Failed to register fb notifier client:%d", ret);
-#else
-	if (mi_disp_register_client(&cd->notifier) < 0) {
-		ts_err("ERROR: register notifier failed!\n");
+	INIT_DELAYED_WORK(&cd->panel_notifier_register_work,
+			  goodix_register_panel_notifier_work);
+
+
+	goodix_ts_check_panel();
+
+	if (active_panel == NULL) {
+		ts_err("Can't find panel,check again after 5s");
+		queue_delayed_work(system_wq, &cd->panel_notifier_register_work,
+				   0x4e2);
+	} else {
+		cd->notifier_cookie = (void *)panel_event_notifier_register(
+			1, 0, active_panel, goodix_drm_state_change_callback,
+			cd);
+		if (cd->notifier_cookie == NULL) {
+			ts_err("Failed to register for panel events");
+		}
 	}
-#endif
-
-
-	/* register charger status change notifier */
 #ifdef CONFIG_TOUCHSCREEN_QGKI_GOODIX
 	INIT_WORK(&cd->power_supply_work, charger_power_supply_work);
 #endif
 	cd->charger_notifier.notifier_call = charger_status_event_callback;
-	if(power_supply_reg_notifier(&cd->charger_notifier))
+	if(power_supply_reg_notifier(&cd->charger_notifier) != 0)
 		ts_err("failed to register charger notifier client");
 
 	/* get ts lockdown info */
