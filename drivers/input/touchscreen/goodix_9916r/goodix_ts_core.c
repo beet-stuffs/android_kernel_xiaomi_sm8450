@@ -3018,6 +3018,15 @@ static int goodix_set_cur_value(int gtp_mode, int gtp_value)
 		return 0;
 	}
 
+        if (gtp_mode == Touch_FodIcon_Enable && goodix_core_data &&
+            gtp_value >= 0) {
+                goodix_core_data->fod_icon_status = gtp_value;
+                ts_info("Touch_FodIcon_Enable value [%d]\n", gtp_value);
+                queue_work(goodix_core_data->gesture_wq,
+                           &goodix_core_data->gesture_work);
+                return 0;
+        }
+
 /* N17 code for HQ-322938 by zhangzhijian5 at 2023/8/28 start */
 	if (gtp_mode >= Touch_Mode_NUM) {
 		ts_err("gtp mode is error:%d", gtp_mode);
